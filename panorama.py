@@ -1,168 +1,212 @@
-from transformers import CLIPTextModel, CLIPTokenizer, logging
-from diffusers import AutoencoderKL, UNet2DConditionModel, DDIMScheduler
-
-# suppress partial model loading warning
-logging.set_verbosity_error()
-
 import torch
-import torch.nn as nn
-import torchvision.transforms as T
-import argparse
-from tqdm import tqdm
-
-def seed_everything(seed):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    # torch.backends.cudnn.deterministic = True
-    # torch.backends.cudnn.benchmark = True
+from tqdm.auto import tqdm
+from diffusers import StableDiffusionPipeline
+from PIL import Image
+import numpy as np
 
 
-def get_views(panorama_height, panorama_width, window_size=64, stride=8):
-    panorama_height /= 8
-    panorama_width /= 8
-    num_blocks_height = (panorama_height - window_size) // stride + 1
-    num_blocks_width = (panorama_width - window_size) // stride + 1
-    total_num_blocks = int(num_blocks_height * num_blocks_width)
-    views = []
-    for i in range(total_num_blocks):
-        h_start = int((i // num_blocks_width) * stride)
-        h_end = h_start + window_size
-        w_start = int((i % num_blocks_width) * stride)
-        w_end = w_start + window_size
-        views.append((h_start, h_end, w_start, w_end))
-    return views
+class MultiDiffusionPanoramaPipeline:
+    """
+    A MultiDiffusion pipeline for generating panoramic images.
+    It takes a base Stable Diffusion pipeline and applies the MultiDiffusion
+    principle to create seamless panoramic outputs.
+    """
 
+    def __init__(self, pipe: StableDiffusionPipeline):
+        self.pipe = pipe
+        self.scheduler = pipe.scheduler  # Use the scheduler from the base pipeline
 
-class MultiDiffusion(nn.Module):
-    def __init__(self, device, sd_version='2.0', hf_key=None):
-        super().__init__()
+    @torch.no_grad()
+    def __call__(
+            self,
+            prompt: str,
+            negative_prompt: str = None,  # Added negative prompt
+            width: int = 1024,
+            height: int = 512,
+            num_inference_steps: int = 50,
+            guidance_scale: float = 7.5,  # Added guidance scale
+            generator: torch.Generator = None,  # Added generator for seed control
+            overlap: int = 64,  # Overlap in pixels, 64 is a common default
+            views_per_step: int = 4  # Number of views processed in parallel per step
+    ):
+        device = self.pipe.device
+        dtype = self.pipe.unet.dtype
 
-        self.device = device
-        self.sd_version = sd_version
+        # 1. Encode prompts
+        text_input = self.pipe.tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=self.pipe.tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+        text_embeddings = self.pipe.text_encoder(text_input.input_ids.to(device))[0]
 
-        print(f'[INFO] loading stable diffusion...')
-        if hf_key is not None:
-            print(f'[INFO] using hugging face custom model key: {hf_key}')
-            model_key = hf_key
-        elif self.sd_version == '2.1':
-            model_key = "stabilityai/stable-diffusion-2-1-base"
-        elif self.sd_version == '2.0':
-            model_key = "stabilityai/stable-diffusion-2-base"
-        elif self.sd_version == '1.5':
-            model_key = "runwayml/stable-diffusion-v1-5"
+        # Handle negative prompt embeddings
+        if negative_prompt is None:
+            uncond_embeddings = torch.zeros_like(text_embeddings)
         else:
-            raise ValueError(f'Stable-diffusion version {self.sd_version} not supported.')
+            uncond_input = self.pipe.tokenizer(
+                negative_prompt,
+                padding="max_length",
+                max_length=self.pipe.tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt",
+            )
+            uncond_embeddings = self.pipe.text_encoder(uncond_input.input_ids.to(device))[0]
 
-        # Create model
-        self.vae = AutoencoderKL.from_pretrained(model_key, subfolder="vae").to(self.device)
-        self.tokenizer = CLIPTokenizer.from_pretrained(model_key, subfolder="tokenizer")
-        self.text_encoder = CLIPTextModel.from_pretrained(model_key, subfolder="text_encoder").to(self.device)
-        self.unet = UNet2DConditionModel.from_pretrained(model_key, subfolder="unet").to(self.device)
+        # Concatenate positive and negative embeddings for classifier-free guidance
+        text_embeddings_cond_uncond = torch.cat([uncond_embeddings, text_embeddings])
 
-        self.scheduler = DDIMScheduler.from_pretrained(model_key, subfolder="scheduler")
+        # 2. Prepare latents
+        # Latent dimensions are usually 1/8th of image dimensions
+        latent_width = width // self.pipe.vae_scale_factor
+        latent_height = height // self.pipe.vae_scale_factor
+        latents_shape = (1, self.pipe.unet.config.in_channels, latent_height, latent_width)
 
-        print(f'[INFO] loaded stable diffusion!')
+        # Initialize latents with noise
+        latents = torch.randn(latents_shape, generator=generator, device=device, dtype=dtype)
 
-    @torch.no_grad()
-    def get_text_embeds(self, prompt, negative_prompt):
-        # prompt, negative_prompt: [str]
+        # Set timesteps
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = self.scheduler.timesteps
 
-        # Tokenize text and get embeddings
-        text_input = self.tokenizer(prompt, padding='max_length', max_length=self.tokenizer.model_max_length,
-                                    truncation=True, return_tensors='pt')
-        text_embeddings = self.text_encoder(text_input.input_ids.to(self.device))[0]
+        # Calculate crop dimensions and positions for the MultiDiffusion approach
+        # Assume square crops for simplicity, as per the paper's base model assumption
+        crop_size = 512 // self.pipe.vae_scale_factor  # Latent crop size for Stable Diffusion v1.5
 
-        # Do the same for unconditional embeddings
-        uncond_input = self.tokenizer(negative_prompt, padding='max_length', max_length=self.tokenizer.model_max_length,
-                                      return_tensors='pt')
+        # Generate overlapping views (crops)
+        # Define a list of (start_x, start_y, end_x, end_y) for each crop in latent space
+        # This will cover the entire panoramic latent space
+        views = []
+        # Calculate horizontal stride to achieve desired overlap for a 512x512 crop
+        # Stride = Crop_size - Overlap
+        stride_x = crop_size - (overlap // self.pipe.vae_scale_factor)
 
-        uncond_embeddings = self.text_encoder(uncond_input.input_ids.to(self.device))[0]
+        for y in range(0, latent_height,
+                       stride_x):  # Use stride_x for y too for square patches, or define a new stride_y
+            for x in range(0, latent_width, stride_x):
+                # Ensure the crop doesn't go out of bounds
+                end_x = min(x + crop_size, latent_width)
+                end_y = min(y + crop_size, latent_height)
+                start_x = end_x - crop_size
+                start_y = end_y - crop_size
+                if start_x < 0: start_x = 0
+                if start_y < 0: start_y = 0
+                views.append((start_x, start_y, end_x, end_y))
 
-        # Cat for final embeddings
-        text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
-        return text_embeddings
+        # Remove duplicate views and sort (optional, but good for consistency)
+        views = sorted(list(set(views)))
 
-    @torch.no_grad()
-    def decode_latents(self, latents):
-        latents = 1 / 0.18215 * latents
-        imgs = self.vae.decode(latents).sample
-        imgs = (imgs / 2 + 0.5).clamp(0, 1)
-        return imgs
+        # Define weight map for fusing patches (e.g., using a Gaussian or constant overlap)
+        # This is the W_i in the paper's equation 4
+        # For simplicity, we can use a constant overlap weight or a blended mask.
+        # A common technique is to use cosine weighting for seamless blending.
+        # For now, let's assume simple averaging in overlapping regions after individual denoising.
+        # The paper's Equation 5 handles this implicitly for "direct pixel samples" which implies averaging.
 
-    @torch.no_grad()
-    def text2panorama(self, prompts, negative_prompts='', height=512, width=2048, num_inference_steps=50,
-                      guidance_scale=7.5):
+        # Create a blank array for the combined denoised latents
+        combined_denoised_latents = torch.zeros_like(latents)
+        # Create a blank array for weights (to handle overlaps)
+        weights_map = torch.zeros_like(latents)
 
-        if isinstance(prompts, str):
-            prompts = [prompts]
+        # Initialize weights map based on overlaps (for proper weighted average)
+        # For each view, create a local weight mask and sum it up
+        # This acts as the denominator in Eq. 5
+        local_weight_mask = torch.ones((1, self.pipe.unet.config.in_channels, crop_size, crop_size), device=device,
+                                       dtype=dtype)
+        for vx1, vy1, vx2, vy2 in views:
+            weights_map[:, :, vy1:vy2, vx1:vx2] += local_weight_mask
 
-        if isinstance(negative_prompts, str):
-            negative_prompts = [negative_prompts]
+        # Ensure no division by zero in non-covered regions
+        weights_map[weights_map == 0] = 1e-6  # Small epsilon to prevent div by zero
 
-        # Prompts -> text embeds
-        text_embeds = self.get_text_embeds(prompts, negative_prompts)  # [2, 77, 768]
+        # 3. Denoising loop
+        for i, t in enumerate(tqdm(timesteps, desc="Generating panorama")):
+            latents_input = latents
 
-        # Define panorama grid and get views
-        latent = torch.randn((1, self.unet.in_channels, height // 8, width // 8), device=self.device)
-        views = get_views(height, width)
-        count = torch.zeros_like(latent)
-        value = torch.zeros_like(latent)
+            # This is where the MultiDiffusion magic happens:
+            # We collect denoised predictions from multiple overlapping views.
+            # Then we combine them.
 
-        self.scheduler.set_timesteps(num_inference_steps)
+            # Store predictions from each view
+            denoised_views_sum = torch.zeros_like(latents)
 
-        with torch.autocast('cuda'):
-            for i, t in enumerate(tqdm(self.scheduler.timesteps)):
-                count.zero_()
-                value.zero_()
+            for j in range(0, len(views), views_per_step):
+                batch_views = views[j: j + views_per_step]
 
-                for h_start, h_end, w_start, w_end in views:
-                    # TODO we can support batches, and pass multiple views at once to the unet
-                    latent_view = latent[:, :, h_start:h_end, w_start:w_end]
+                batch_latents_crops = []
+                for vx1, vy1, vx2, vy2 in batch_views:
+                    # F_i(J_t) operation: Take a crop from current latents
+                    crop = latents_input[:, :, vy1:vy2, vx1:vx2]
+                    # Pad if crop size is smaller than expected (e.g., at edges)
+                    pad_x = crop_size - crop.shape[3]
+                    pad_y = crop_size - crop.shape[2]
+                    if pad_x > 0 or pad_y > 0:
+                        crop = torch.nn.functional.pad(crop, (0, pad_x, 0, pad_y), "constant", 0)
+                    batch_latents_crops.append(crop)
 
-                    # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
-                    latent_model_input = torch.cat([latent_view] * 2)
+                if not batch_latents_crops:
+                    continue
 
-                    # predict the noise residual
-                    noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeds)['sample']
+                batch_latents_crops = torch.cat(batch_latents_crops, dim=0)  # Batch for UNet
 
-                    # perform guidance
-                    noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                # Predict noise for each crop (Phi(I_t^i | y_i) operation conceptually)
+                # Apply classifier-free guidance
+                latent_model_input = torch.cat([batch_latents_crops] * 2) if guidance_scale > 1 else batch_latents_crops
+                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-                    # compute the denoising step with the reference model
-                    latents_view_denoised = self.scheduler.step(noise_pred, t, latent_view)['prev_sample']
-                    value[:, :, h_start:h_end, w_start:w_end] += latents_view_denoised
-                    count[:, :, h_start:h_end, w_start:w_end] += 1
+                # Uncond and cond embeddings for the batch
+                batch_text_embeddings_cond_uncond = text_embeddings_cond_uncond.repeat(len(batch_views), 1, 1)
 
-                # take the MultiDiffusion step
-                latent = torch.where(count > 0, value / count, value)
+                noise_pred = self.pipe.unet(
+                    latent_model_input,
+                    t,
+                    encoder_hidden_states=batch_text_embeddings_cond_uncond,
+                    return_dict=False,
+                )[0]
 
-        # Img latents -> imgs
-        imgs = self.decode_latents(latent)  # [1, 3, 512, 512]
-        img = T.ToPILImage()(imgs[0].cpu())
-        return img
+                # Perform guidance
+                if guidance_scale > 1:
+                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
+                # Denoise each crop individually (part of Phi(I_t^i | y_i) -> I_t-1^i)
+                # The scheduler step implicitly gives the denoised latents
+                denoised_crops = self.scheduler.step(noise_pred, t, batch_latents_crops).pred_original_sample
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--prompt', type=str, default='a photo of the dolomites')
-    parser.add_argument('--negative', type=str, default='')
-    parser.add_argument('--sd_version', type=str, default='2.0', choices=['1.5', '2.0'],
-                        help="stable diffusion version")
-    parser.add_argument('--H', type=int, default=512)
-    parser.add_argument('--W', type=int, default=4096)
-    parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--steps', type=int, default=50)
-    parser.add_argument('--outfile', type=str, default='out.png')
-    opt = parser.parse_args()
+                # F_i^-1 operation: Place denoised crops back into the full panorama latent map
+                for k, (vx1, vy1, vx2, vy2) in enumerate(batch_views):
+                    denoised_crop_k = denoised_crops[k]
+                    # Remove padding if applied
+                    denoised_crop_k = denoised_crop_k[:, :vy2 - vy1, :vx2 - vx1]
+                    denoised_views_sum[:, :, vy1:vy2, vx1:vx2] += denoised_crop_k
 
-    seed_everything(opt.seed)
+            # Average overlapping regions by dividing by the sum of weights (Equation 5 numerator)
+            fused_latents = denoised_views_sum / weights_map
 
-    device = torch.device('cuda')
+            # Now, we need to calculate the *actual* noise prediction for the full latent
+            # that would result in `fused_latents`
+            # This is a bit tricky, as the paper suggests solving for J_{t-1} directly.
+            # The simplified closed-form in Eq. 5 is for `Psi(J_t|z)` returning the *denoised* J_{t-1}.
+            # We need to adapt the standard diffusion step to this fused J_{t-1}.
 
-    sd = MultiDiffusion(device, opt.sd_version)
+            # The standard diffusion step (x_t -> x_{t-1}) involves pred_original_sample (x_0_pred)
+            # and then applying scheduler equations.
+            # So, `fused_latents` here *is* our `pred_original_sample` for the entire image.
 
-    img = sd.text2panorama(opt.prompt, opt.negative, opt.H, opt.W, opt.steps)
+            # Compute the residual noise based on this fused prediction
+            noise_pred_for_full_latent = (latents - fused_latents) / self.scheduler.sigmas[i]
 
-    # save image
-    img.save(opt.outfile)
+            # Update latents for the next step using the scheduler
+            latents = self.scheduler.step(noise_pred_for_full_latent, t, latents).prev_sample
+
+        # 4. Decode latents to image
+        # scale and decode the image latents with vae
+        latents = 1 / self.pipe.vae.config.scaling_factor * latents
+        image = self.pipe.vae.decode(latents.cpu()).sample
+        image = (image / 2 + 0.5).clamp(0, 1)
+        image = image.cpu().permute(0, 2, 3, 1).float().numpy()
+        image = self.pipe.numpy_to_pil(image)
+        return {"images": image}
+

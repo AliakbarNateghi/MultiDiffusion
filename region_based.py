@@ -1,211 +1,200 @@
-from transformers import CLIPTextModel, CLIPTokenizer, logging
-from diffusers import AutoencoderKL, UNet2DConditionModel, DDIMScheduler
-
-# suppress partial model loading warning
-logging.set_verbosity_error()
-
 import torch
-import torch.nn as nn
-import torchvision.transforms as T
-import argparse
-import numpy as np
+from tqdm.auto import tqdm
+from diffusers import StableDiffusionPipeline
 from PIL import Image
+import numpy as np
+from typing import List, Tuple
 
 
-def seed_everything(seed):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    # torch.backends.cudnn.deterministic = True
-    # torch.backends.cudnn.benchmark = True
+class MultiDiffusionRegionBasedPipeline:
+    """
+    A MultiDiffusion pipeline for region-based image generation.
+    It takes a base Stable Diffusion pipeline and allows generating images
+    where specific content appears in user-defined regions.
+    """
 
+    def __init__(self, pipe: StableDiffusionPipeline):
+        self.pipe = pipe
+        self.scheduler = pipe.scheduler  # Use the scheduler from the base pipeline
 
-def get_views(panorama_height, panorama_width, window_size=64, stride=8):
-    panorama_height /= 8
-    panorama_width /= 8
-    num_blocks_height = (panorama_height - window_size) // stride + 1
-    num_blocks_width = (panorama_width - window_size) // stride + 1
-    total_num_blocks = int(num_blocks_height * num_blocks_width)
-    views = []
-    for i in range(total_num_blocks):
-        h_start = int((i // num_blocks_width) * stride)
-        h_end = h_start + window_size
-        w_start = int((i % num_blocks_width) * stride)
-        w_end = w_start + window_size
-        views.append((h_start, h_end, w_start, w_end))
-    return views
+    @torch.no_grad()
+    def __call__(
+            self,
+            regions: List[Tuple[Image.Image, str]],  # List of (mask_image, prompt_text)
+            negative_prompt: str = None,  # Added negative prompt
+            num_inference_steps: int = 50,
+            guidance_scale: float = 7.5,  # Added guidance scale
+            generator: torch.Generator = None,  # Added generator for seed control
+            image_size: Tuple[int, int] = (512, 512),  # Output image size
+            bootstrapping_steps_ratio: float = 0.2  # T_init ratio as per paper
+    ):
+        device = self.pipe.device
+        dtype = self.pipe.unet.dtype
 
+        if not regions:
+            raise ValueError("At least one region (mask, prompt) must be provided.")
 
-class MultiDiffusion(nn.Module):
-    def __init__(self, device, sd_version='2.0', hf_key=None):
-        super().__init__()
+        # Prepare mask tensors
+        # Assuming masks are already PIL Images (L mode) and same size as image_size
+        masks_tensor_list = []
+        prompt_list = []
+        for mask_img, prompt_txt in regions:
+            # Ensure mask is L mode and resized to match image_size for consistency
+            if mask_img.mode != 'L':
+                mask_img = mask_img.convert('L')
+            mask_img = mask_img.resize(image_size, Image.LANCZOS)
 
-        self.device = device
-        self.sd_version = sd_version
+            # Convert mask to latent space resolution (1/8th)
+            mask_latent = Image.fromarray(np.array(mask_img) > 128).resize(
+                (image_size[0] // self.pipe.vae_scale_factor, image_size[1] // self.pipe.vae_scale_factor),
+                Image.NEAREST
+            )
+            mask_latent_tensor = torch.from_numpy(np.array(mask_latent).astype(np.float32) / 255.0).to(
+                device).unsqueeze(0).unsqueeze(0)
+            masks_tensor_list.append(mask_latent_tensor)
+            prompt_list.append(prompt_txt)
 
-        print(f'[INFO] loading stable diffusion...')
-        if hf_key is not None:
-            print(f'[INFO] using hugging face custom model key: {hf_key}')
-            model_key = hf_key
-        elif self.sd_version == '2.1':
-            model_key = "stabilityai/stable-diffusion-2-1-base"
-        elif self.sd_version == '2.0':
-            model_key = "stabilityai/stable-diffusion-2-base"
-        elif self.sd_version == '1.5':
-            model_key = "runwayml/stable-diffusion-v1-5"
+        # Combine masks for overall coverage map
+        # This will be used for weighted averaging
+        total_mask_coverage = torch.zeros_like(masks_tensor_list[0])
+        for m_t in masks_tensor_list:
+            total_mask_coverage += m_t
+        total_mask_coverage[total_mask_coverage == 0] = 1e-6  # Avoid division by zero
+
+        # 1. Encode prompts for each region
+        text_embeddings_list = []
+        for p_txt in prompt_list:
+            text_input = self.pipe.tokenizer(
+                p_txt,
+                padding="max_length",
+                max_length=self.pipe.tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt",
+            )
+            text_embeddings_list.append(self.pipe.text_encoder(text_input.input_ids.to(device))[0])
+
+        # Handle negative prompt embeddings
+        if negative_prompt is None:
+            uncond_embeddings = torch.zeros_like(text_embeddings_list[0])
         else:
-            model_key = self.sd_version #For custom models or fine-tunes, allow people to use arbitrary versions
-            #raise ValueError(f'Stable-diffusion version {self.sd_version} not supported.')
+            uncond_input = self.pipe.tokenizer(
+                negative_prompt,
+                padding="max_length",
+                max_length=self.pipe.tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt",
+            )
+            uncond_embeddings = self.pipe.text_encoder(uncond_input.input_ids.to(device))[0]
 
-        # Create model
-        self.vae = AutoencoderKL.from_pretrained(model_key, subfolder="vae").to(self.device)
-        self.tokenizer = CLIPTokenizer.from_pretrained(model_key, subfolder="tokenizer")
-        self.text_encoder = CLIPTextModel.from_pretrained(model_key, subfolder="text_encoder").to(self.device)
-        self.unet = UNet2DConditionModel.from_pretrained(model_key, subfolder="unet").to(self.device)
+        # Prepare full text embeddings for conditional and unconditional
+        # This will be [uncond_embeds, cond_embeds_region1, cond_embeds_region2, ...]
+        full_text_embeddings_cond_uncond = torch.cat([uncond_embeddings] + text_embeddings_list)
 
-        self.scheduler = DDIMScheduler.from_pretrained(model_key, subfolder="scheduler")
+        # 2. Prepare latents
+        latent_width = image_size[0] // self.pipe.vae_scale_factor
+        latent_height = image_size[1] // self.pipe.vae_scale_factor
+        latents_shape = (1, self.pipe.unet.config.in_channels, latent_height, latent_width)
 
-        print(f'[INFO] loaded stable diffusion!')
+        latents = torch.randn(latents_shape, generator=generator, device=device, dtype=dtype)
 
-    @torch.no_grad()
-    def get_random_background(self, n_samples):
-        # sample random background with a constant rgb value
-        backgrounds = torch.rand(n_samples, 3, device=self.device)[:, :, None, None].repeat(1, 1, 512, 512)
-        return torch.cat([self.encode_imgs(bg.unsqueeze(0)) for bg in backgrounds])
+        # Set timesteps
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = self.scheduler.timesteps
 
-    @torch.no_grad()
-    def get_text_embeds(self, prompt, negative_prompt):
-        # Tokenize text and get embeddings
-        text_input = self.tokenizer(prompt, padding='max_length', max_length=self.tokenizer.model_max_length,
-                                    truncation=True, return_tensors='pt')
-        text_embeddings = self.text_encoder(text_input.input_ids.to(self.device))[0]
+        # Pre-compute S_t for bootstrapping phase (constant color image noised to t)
+        # This is a simplification; paper says random image with constant color.
+        # We'll just noise a black image for a consistent background.
+        bootstrapping_latents_by_t = {}
+        T_init = int(bootstrapping_steps_ratio * num_inference_steps)
+        if T_init > 0:
+            # Create a black image latent
+            black_image_latent = self.pipe.vae.encode(
+                torch.zeros(1, 3, image_size[1], image_size[0]).to(device=device, dtype=dtype)).latent_dist.sample()
+            black_image_latent = black_image_latent * self.pipe.vae.config.scaling_factor
 
-        # Do the same for unconditional embeddings
-        uncond_input = self.tokenizer(negative_prompt, padding='max_length', max_length=self.tokenizer.model_max_length,
-                                      return_tensors='pt')
+            for step_idx in range(T_init):
+                t = timesteps[step_idx]
+                noise = torch.randn(latents_shape, device=device, dtype=dtype)
+                # Compute S_t as a noisy version of the black latent
+                # This aligns with the paper's Appendix B.2
+                noisy_latent = self.scheduler.add_noise(black_image_latent, noise, t)
+                bootstrapping_latents_by_t[t] = noisy_latent
 
-        uncond_embeddings = self.text_encoder(uncond_input.input_ids.to(self.device))[0]
+        # 3. Denoising loop
+        for i, t in enumerate(tqdm(timesteps, desc="Generating region-based image")):
 
-        # Cat for final embeddings
-        text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
-        return text_embeddings
+            # This is where the F_i(J_t) operation for bootstrapping comes in
+            current_latents_for_phi_list = []
+            if i < T_init and bootstrapping_steps_ratio > 0:
+                s_t_latent = bootstrapping_latents_by_t[t]
+                for k, mask_tensor in enumerate(masks_tensor_list):
+                    # F_i(J_t) = M_i * J_t + (1-M_i) * S_t
+                    # J_t here is `latents`
+                    bootstrapped_latent = mask_tensor * latents + (1 - mask_tensor) * s_t_latent
+                    current_latents_for_phi_list.append(bootstrapped_latent)
+            else:
+                # F_i(J_t) = J_t (identity mapping for later steps)
+                current_latents_for_phi_list = [latents] * len(prompt_list)
 
-    @torch.no_grad()
-    def encode_imgs(self, imgs):
-        imgs = 2 * imgs - 1
-        posterior = self.vae.encode(imgs).latent_dist
-        latents = posterior.sample() * 0.18215
-        return latents
+            # Prepare batch for UNet: [uncond_latent, cond_latent_region1, cond_latent_region2, ...]
+            # Note: For region based, the "uncond_latent" is just the full latent
+            # and each cond_latent is the original full latent but with specific text prompt.
 
-    @torch.no_grad()
-    def decode_latents(self, latents):
-        latents = 1 / 0.18215 * latents
-        imgs = self.vae.decode(latents).sample
-        imgs = (imgs / 2 + 0.5).clamp(0, 1)
-        return imgs
+            # For each region, we need to make a prediction for the *entire* latent.
+            # Then we'll average them based on masks.
 
-    @torch.no_grad()
-    def generate(self, masks, prompts, negative_prompts='', height=512, width=2048, num_inference_steps=50,
-                      guidance_scale=7.5, bootstrapping=20):
+            # The input to UNet is (batch_size, channels, H, W)
+            # The text embeddings will be (1+num_regions, 77, 768)
 
-        # get bootstrapping backgrounds
-        # can move this outside of the function to speed up generation. i.e., calculate in init
-        bootstrapping_backgrounds = self.get_random_background(bootstrapping)
+            # Build the batch of latents for UNet: [uncond_latents, region1_latents, region2_latents, ...]
+            latent_model_input = torch.cat([latents] * (1 + len(prompt_list)))  # For uncond and each region
+            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-        # Prompts -> text embeds
-        text_embeds = self.get_text_embeds(prompts, negative_prompts)  # [2 * len(prompts), 77, 768]
+            # Pass all prepared embeddings
+            noise_pred = self.pipe.unet(
+                latent_model_input,
+                t,
+                encoder_hidden_states=full_text_embeddings_cond_uncond,
+                return_dict=False,
+            )[0]
 
-        # Define panorama grid and get views
-        latent = torch.randn((1, self.unet.in_channels, height // 8, width // 8), device=self.device)
-        noise = latent.clone().repeat(len(prompts) - 1, 1, 1, 1)
-        views = get_views(height, width)
-        count = torch.zeros_like(latent)
-        value = torch.zeros_like(latent)
+            # Split predictions: first is uncond, then region-specific
+            noise_pred_uncond = noise_pred[0]
+            noise_preds_regions = noise_pred[1:]
 
-        self.scheduler.set_timesteps(num_inference_steps)
+            # Apply guidance scale for each region-specific prediction
+            # The paper's region-based formulation implicitly performs guidance by averaging noise.
+            # We apply CFG to each regional prediction first.
+            guided_noise_preds_list = []
+            for k in range(len(prompt_list)):
+                guided_noise_preds_list.append(
+                    noise_pred_uncond + guidance_scale * (noise_preds_regions[k] - noise_pred_uncond))
 
-        with torch.autocast('cuda'):
-            for i, t in enumerate(self.scheduler.timesteps):
-                count.zero_()
-                value.zero_()
+            # Now, apply the W_i (mask) weighting and summation (Equation 4 & 5 logic)
+            # Denoise each region's prediction individually (conceptually Phi(I_t^i | y_i) -> I_t-1^i)
+            # These are actually `noise_pred`s, so we combine the noise predictions, not denoised samples directly.
 
-                for h_start, h_end, w_start, w_end in views:
-                    masks_view = masks[:, :, h_start:h_end, w_start:w_end]
-                    latent_view = latent[:, :, h_start:h_end, w_start:w_end].repeat(len(prompts), 1, 1, 1)
-                    if i < bootstrapping:
-                        bg = bootstrapping_backgrounds[torch.randint(0, bootstrapping, (len(prompts) - 1,))]
-                        bg = self.scheduler.add_noise(bg, noise[:, :, h_start:h_end, w_start:w_end], t)
-                        latent_view[1:] = latent_view[1:] * masks_view[1:] + bg * (1 - masks_view[1:])
+            # The paper's Eq. 5 is for `Psi(J_t|z)` returning the *denoised* J_{t-1}.
+            # Here, we combine the *noise predictions* for the current step,
+            # then use the scheduler to get the next latent.
 
-                    # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
-                    latent_model_input = torch.cat([latent_view] * 2)
+            # Reconcile noise predictions using masks (similar to Eq. 5 principle for noise)
+            fused_noise_pred = torch.zeros_like(noise_pred_uncond)
+            for k, (mask_img, _) in enumerate(regions):
+                mask_latent_tensor = masks_tensor_list[k]  # Already prepared
+                fused_noise_pred += mask_latent_tensor * guided_noise_preds_list[k]
 
-                    # predict the noise residual
-                    noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeds)['sample']
+            # Divide by total mask coverage to average overlaps
+            fused_noise_pred = fused_noise_pred / total_mask_coverage
 
-                    # perform guidance
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+            # Update latents for the next step using the scheduler with the fused noise prediction
+            latents = self.scheduler.step(fused_noise_pred, t, latents).prev_sample
 
-                    # compute the denoising step with the reference model
-                    latents_view_denoised = self.scheduler.step(noise_pred, t, latent_view)['prev_sample']
+        # 4. Decode latents to image
+        latents = 1 / self.pipe.vae.config.scaling_factor * latents
+        image = self.pipe.vae.decode(latents.cpu()).sample
+        image = (image / 2 + 0.5).clamp(0, 1)
+        image = image.cpu().permute(0, 2, 3, 1).float().numpy()
+        image = self.pipe.numpy_to_pil(image)
+        return {"images": image}
 
-                    value[:, :, h_start:h_end, w_start:w_end] += (latents_view_denoised * masks_view).sum(dim=0,
-                                                                                                          keepdims=True)
-                    count[:, :, h_start:h_end, w_start:w_end] += masks_view.sum(dim=0, keepdims=True)
-
-                # take the MultiDiffusion step
-                latent = torch.where(count > 0, value / count, value)
-
-        # Img latents -> imgs
-        imgs = self.decode_latents(latent)  # [1, 3, 512, 512]
-        img = T.ToPILImage()(imgs[0].cpu())
-        return img
-
-
-def preprocess_mask(mask_path, h, w, device):
-    mask = np.array(Image.open(mask_path).convert("L"))
-    mask = mask.astype(np.float32) / 255.0
-    mask = mask[None, None]
-    mask[mask < 0.5] = 0
-    mask[mask >= 0.5] = 1
-    mask = torch.from_numpy(mask).to(device)
-    mask = torch.nn.functional.interpolate(mask, size=(h, w), mode='nearest')
-    return mask
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--mask_paths', type=list)
-    # important: it is necessary that SD output high-quality images for the bg/fg prompts.
-    parser.add_argument('--bg_prompt', type=str)
-    parser.add_argument('--bg_negative', type=str)  # 'artifacts, blurry, smooth texture, bad quality, distortions, unrealistic, distorted image'
-    parser.add_argument('--fg_prompts', type=list)
-    parser.add_argument('--fg_negative', type=list)  # 'artifacts, blurry, smooth texture, bad quality, distortions, unrealistic, distorted image'
-    parser.add_argument('--sd_version', type=str, default='2.0', choices=['1.5', '2.0'],
-                        help="stable diffusion version")
-    parser.add_argument('--H', type=int, default=768)
-    parser.add_argument('--W', type=int, default=512)
-    parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--steps', type=int, default=50)
-    # bootstrapping encourages high fidelity to tight masks, the value can be lowered is most cases
-    parser.add_argument('--bootstrapping', type=int, default=20)
-    opt = parser.parse_args()
-
-    seed_everything(opt.seed)
-
-    device = torch.device('cuda')
-
-    sd = MultiDiffusion(device, opt.sd_version)
-
-    fg_masks = torch.cat([preprocess_mask(mask_path, opt.H // 8, opt.W // 8, device) for mask_path in opt.mask_paths])
-    bg_mask = 1 - torch.sum(fg_masks, dim=0, keepdim=True)
-    bg_mask[bg_mask < 0] = 0
-    masks = torch.cat([bg_mask, fg_masks])
-
-    prompts = [opt.bg_prompt] + opt.fg_prompts
-    neg_prompts = [opt.bg_negative] + opt.fg_negative
-
-    img = sd.generate(masks, prompts, neg_prompts, opt.H, opt.W, opt.steps, bootstrapping=opt.bootstrapping)
-
-    # save image
-    img.save('out.png')

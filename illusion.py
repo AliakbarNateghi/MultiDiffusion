@@ -1,85 +1,147 @@
 import torch
+from tqdm.auto import tqdm
+from diffusers import StableDiffusionPipeline
 from PIL import Image
-from diffusers import (
-    AutoencoderKL,
-    ControlNetModel,
-    EulerDiscreteScheduler
-)
-from pipeline_controlnet import StableDiffusionControlNetPipeline
-import argparse
+import numpy as np
+import cv2
 
 
-# https://huggingface.co/spaces/AP123/IllusionDiffusion/blob/main/app.py
-def center_crop_resize(img, output_size=(512, 512)):
-    width, height = img.size
+class MultiDiffusionIllusionDiffusionPipeline:
+    """
+    A MultiDiffusion pipeline for Illusion Diffusion.
+    It takes a base Stable Diffusion pipeline and combines it with a control image
+    to generate images that incorporate the control image's structure/pattern.
+    """
 
-    aspect_orig = width/height;
-    aspect_dest = output_size[0]/output_size[1]
+    def __init__(self, pipe: StableDiffusionPipeline):
+        self.pipe = pipe
+        self.scheduler = pipe.scheduler  # Use the scheduler from the base pipeline
 
-    if(aspect_orig > aspect_dest):
-        # input is too wide, scale based on height and trim left/right
-        new_height = img.height
-        new_width = int(img.height * aspect_dest)
-    else:
-        # input is too tall, scale based on width and trip top/bottom
-        new_width = img.width
-        new_height = int(img.width / aspect_dest)
+    @torch.no_grad()
+    def __call__(
+            self,
+            prompt: str,
+            control_image: Image.Image,
+            negative_prompt: str = None,  # Added negative prompt
+            num_inference_steps: int = 50,
+            guidance_scale: float = 7.5,  # Added guidance scale
+            generator: torch.Generator = None,  # Added generator for seed control
+            ddim_steps: int = 50,  # Specific to DDIM if used for inversion/forward process
+            strength: float = 0.5  # Controls how much the control image influences
+    ):
+        device = self.pipe.device
+        dtype = self.pipe.unet.dtype
 
-    left = (width - new_width) / 2
-    top = (height - new_height) / 2
-    right = (width + new_width) / 2
-    bottom = (height + new_height) / 2
+        # 1. Prepare control image
+        # Resize control image to match target generation size (e.g., 512x512)
+        # Assuming target size is 512x512 for standard SD v1.5
+        image_size = (512, 512)
+        if control_image.size != image_size:
+            control_image = control_image.resize(image_size, Image.LANCZOS)
 
-    # Crop and resize
-    img = img.crop((left, top, right, bottom))
-    img = img.resize(output_size)
-    return img
+        # Convert control image to a tensor and normalize
+        # Assuming grayscale or average for simple control, or more complex pre-processing
+        control_tensor = torch.from_numpy(np.array(control_image).astype(np.float32) / 255.0).to(device).unsqueeze(0)
+        if control_tensor.shape[3] == 3:  # If RGB, convert to grayscale or take one channel
+            control_tensor = control_tensor.mean(dim=-1, keepdim=True)  # Simple grayscale
 
+        # In a real illusion diffusion, `control_image` would be used to guide the noise prediction.
+        # This often involves adding a "control" signal to the UNet's input or features.
+        # The original `illusion.py` uses `self.encode_img` and `self.ddim_inversion`.
+        # This implies it's using the control image to get an initial latent representation,
+        # and then modifying the diffusion process.
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--prompt', type=str, default="Medieval village scene with busy streets and castle in the distance")
-    parser.add_argument('--controlnet_img', type=str, default="pano_pattern.png")
-    parser.add_argument('--negative_prompt', type=str, default='low quality')
-    # controls the fidelity to the controlnet signal. May have to be adjusted depending on the input
-    parser.add_argument('--controlnet_scale', type=float, default=1.3)
-    parser.add_argument('--guidance_scale', type=float, default=7.5)
-    parser.add_argument('--H', type=int, default=512)
-    parser.add_argument('--W', type=int, default=1536)
-    parser.add_argument('--steps', type=int, default=30)
-    parser.add_argument('--seed', type=int, default=-1)
-    parser.add_argument('--stride', type=int, default=64)
-    parser.add_argument('--outfile', type=str, default='out.png')
-    opt = parser.parse_args()
+        # The paper's `illusion.py` is quite specific, using DDIM inversion.
+        # Let's align with its original intent for `control_image` usage.
+        # `strength` here is crucial for how much the inverted control image impacts.
 
-    h, w = opt.H, opt.W
-    h = h - h % opt.stride
-    w = w - w % opt.stride
+        # The original illusion.py has `_encode_img` and `ddim_inversion`
+        # and then modifies latents directly.
+        # Let's ensure the `strength` parameter is used to blend the inverted latent.
 
-    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse")
-    controlnet = ControlNetModel.from_pretrained(
-        "monster-labs/control_v1p_sd15_qrcode_monster")
-    pipe = StableDiffusionControlNetPipeline.from_pretrained(
-        "SG161222/Realistic_Vision_V5.1_noVAE",
-        controlnet=controlnet,
-        vae=vae,
-        safety_checker=None,
-    ).to("cuda")
+        # --- Re-using the structure from the original illusion.py with added parameters ---
+        # The original code encodes the image and then adds noise to it based on the scheduler steps
+        # This is where strength usually applies - by starting at a "noisier" version of the image.
 
-    control_image = Image.open(opt.controlnet_img).convert("RGB")
-    control_image = center_crop_resize(control_image, output_size=(w, h))
-    pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
+        # 1. Encode prompts
+        text_input = self.pipe.tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=self.pipe.tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+        text_embeddings = self.pipe.text_encoder(text_input.input_ids.to(device))[0]
 
-    out = pipe(
-        prompt=opt.prompt,
-        negative_prompt=opt.negative_prompt,
-        image=control_image,
-        guidance_scale=opt.guidance_scale,
-        controlnet_conditioning_scale=opt.controlnet_scale,
-        generator=torch.manual_seed(opt.seed) if opt.seed != -1 else torch.Generator(),
-        num_inference_steps=opt.steps,
-        height=h,
-        width=w,
-        stride=opt.stride // 8
-    ).images[0]
-    out.save(opt.outfile)
+        if negative_prompt is None:
+            uncond_embeddings = torch.zeros_like(text_embeddings)
+        else:
+            uncond_input = self.pipe.tokenizer(
+                negative_prompt,
+                padding="max_length",
+                max_length=self.pipe.tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt",
+            )
+            uncond_embeddings = self.pipe.text_encoder(uncond_input.input_ids.to(device))[0]
+
+        text_embeddings_cond_uncond = torch.cat([uncond_embeddings, text_embeddings])
+
+        # 2. Prepare latents based on control_image and strength
+        # This is the core "illusion" part. The control_image is first encoded,
+        # then possibly noised to a certain degree based on `strength`.
+
+        # Encode the control image
+        # control_image needs to be 3-channel for VAE encoder
+        if control_image.mode != 'RGB':
+            control_image = control_image.convert('RGB')
+
+        control_image_tensor = self.pipe.image_processor.preprocess(control_image).to(device=device, dtype=dtype)
+        # Using pipe's VAE to encode the control image
+        control_latent = self.pipe.vae.encode(control_image_tensor).latent_dist.sample()
+        control_latent = control_latent * self.pipe.vae.config.scaling_factor
+
+        # Determine the starting noise level based on strength
+        # The number of steps the control image is noised to
+        init_timestep = int(num_inference_steps * strength)
+        init_timestep = min(init_timestep, num_inference_steps - 1)  # Ensure valid timestep
+
+        # Get initial latents by adding noise to the control latent
+        noise = torch.randn(control_latent.shape, generator=generator, device=device, dtype=dtype)
+        # Scheduler provides a `sample` at the specified timestep `t`
+        # This is the `latents` that diffusion starts from.
+
+        # Using the scheduler's `add_noise` to get `z_t` from `z_0`
+        timesteps_to_noise = self.scheduler.timesteps[init_timestep]  # Get the specific t for init_timestep
+        latents = self.scheduler.add_noise(control_latent, noise, timesteps_to_noise)
+
+        # Set timesteps for the denoising loop
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = self.scheduler.timesteps[init_timestep:]  # Start from init_timestep
+
+        # 3. Denoising loop
+        for i, t in enumerate(tqdm(timesteps, desc="Generating illusion")):
+            # Standard classifier-free guidance
+            latent_model_input = torch.cat([latents] * 2)
+            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+            noise_pred = self.pipe.unet(
+                latent_model_input,
+                t,
+                encoder_hidden_states=text_embeddings_cond_uncond,
+                return_dict=False,
+            )[0]
+
+            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+            latents = self.scheduler.step(noise_pred, t, latents).prev_sample
+
+        # 4. Decode latents to image
+        latents = 1 / self.pipe.vae.config.scaling_factor * latents
+        image = self.pipe.vae.decode(latents.cpu()).sample
+        image = (image / 2 + 0.5).clamp(0, 1)
+        image = image.cpu().permute(0, 2, 3, 1).float().numpy()
+        image = self.pipe.numpy_to_pil(image)
+        return {"images": image}
+
